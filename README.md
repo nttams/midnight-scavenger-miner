@@ -12,6 +12,37 @@ This repository contains only the **worker** component. To run the full system, 
 - **A submitter service**
 
 ## How it works (Stateless & Horizontally Scalable)
+```
+
+                     +----------------------+
+                     |   Midnight Endpoint  |
+                     +----------+-----------+
+                                ^
+                                |
+                                |
+                        +---------------+
+                        |   Submitter   |
+                        |  (fetch tasks |
+                        |   & submit)   |
+                        +-------+-------+
+                                |
+                                v
+                       +-----------------+
+                       |     MongoDB     |
+                       | (state & unique |
+                       |   task claims)  |
+                       +--------+--------+
+                                |
+     -------------------------------------------------
+     |                 |                |            |
+     v                 v                v            v
++------------+   +------------+   +------------+  +------------+
+|  Worker 1  |   |  Worker 2  |   |  Worker 3  |  |  Worker n  |
+| (fetch +   |   | (fetch +   |   | (fetch +   |  | (fetch +   |
+|  claim +   |   |  claim +   |   |  claim +   |  |  claim +   |
+|  solve)    |   |  solve)    |   |  solve)    |  |  solve)    |
++------------+   +------------+   +------------+  +------------+
+```
 
 The entire design is built around being **stateless**, so workers can scale horizontally without coordination.  
 All state lives in **MongoDB**, and **unique indexes** ensure that no two workers ever duplicate work.
