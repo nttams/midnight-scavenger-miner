@@ -18,7 +18,7 @@ impl Submitter {
     pub fn fetch_challenge(&self) -> anyhow::Result<Challenge> {
         let url = format!("{}/challenge", self.cfg.base_url);
 
-        let resp = self.client.get(url).send()?.error_for_status()?; // convert non-200 into error
+        let resp = self.client.get(url).send()?.error_for_status()?;
 
         let mut data: Challenge = resp.json()?;
 
@@ -45,8 +45,11 @@ mod tests {
 
         let submitter = Submitter::new(cfg);
 
-        let resp = submitter.fetch_challenge().unwrap();
+        let chall = submitter.fetch_challenge().unwrap();
 
-        println!("Fetched challenge haha: {:?}", resp);
+        println!(
+            "Fetched challenge: {}",
+            serde_json::to_string(&chall).unwrap()
+        );
     }
 }
