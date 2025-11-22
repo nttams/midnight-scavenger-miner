@@ -1,4 +1,4 @@
-use miner;
+use miner::miner::*;
 use std::env;
 use std::thread;
 use std::time::Duration;
@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
 
     let mongo_url = env::var("MONGO_URL").expect("MONGO_URL not set");
 
-    let mongodb_config = miner::MongodbConfig {
+    let mongodb_config = MongodbConfig {
         mongo_url: mongo_url.clone(),
         mongo_db: "defensio".to_string(),
         coll_config: "config".to_string(),
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         coll_submit: "submit".to_string(),
     };
 
-    let m = miner::Miner::new(&instance_id, mongodb_config);
+    let m = Miner::new(&instance_id, mongodb_config);
     loop {
         println!("================================");
         println!("starting a new run");
