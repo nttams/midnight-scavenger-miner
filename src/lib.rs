@@ -6,19 +6,19 @@ use mongodb::bson::doc;
 use mongodb::sync::{Collection, Database};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MONGO_URI: &str = "TODO";
+const MONGO_DB: &str = "defensio";
 const COLL_CONFIG: &str = "config";
-const COLL_CHALLENGES: &str = "challenges";
-const COLL_ADDRESSES: &str = "addresses";
+const COLL_CHALLENGES: &str = "challenge";
+const COLL_ADDRESSES: &str = "address";
 const COLL_SUBMIT: &str = "submit";
 
-pub struct MidnightMiner {
+pub struct Miner {
     cfg: Config,
     stat: Arc<Stat>,
     mongo_client: Option<mongodb::sync::Client>,
@@ -37,9 +37,9 @@ struct Stat {
     total_task: AtomicI32,
 }
 
-impl MidnightMiner {
-    pub fn new(instance_id: &str) -> Self {
-        let mut miner = MidnightMiner {
+impl Miner {
+    pub fn new(instance_id: &str, mongo_url: &str) -> Self {
+        let mut miner = Miner {
             cfg: Config::default(),
             mongo_client: None,
             coll_submit: None,
@@ -55,19 +55,28 @@ impl MidnightMiner {
         };
 
         miner.mongo_client = Some(
-            mongodb::sync::Client::with_uri_str(MONGO_URI).expect("failed to init mongo client"),
+            mongodb::sync::Client::with_uri_str(mongo_url).expect("failed to init mongo client"),
         );
-        miner.mongo_db = Some(miner.mongo_client.as_ref().unwrap().database("mn"));
+        miner.mongo_db = Some(miner.mongo_client.as_ref().unwrap().database(MONGO_DB));
         miner.coll_submit = Some(miner.mongo_db.as_ref().unwrap().collection(COLL_SUBMIT));
 
-        let cfg = fetch_config(miner.mongo_db.as_ref().unwrap(), &instance_id)
+        let mut cfg = fetch_config(miner.mongo_db.as_ref().unwrap(), &instance_id)
             .expect("failed to fetch config");
-        println!("config: {cfg:#?}");
+
+        if cfg.num_threads <= 0 {
+            let threads = std::thread::available_parallelism().unwrap().get();
+            cfg.num_threads = threads as i32; // if not set, use all available
+        }
+        if cfg.num_threads <= 0 {
+            cfg.num_threads = 1; // fallback
+        }
 
         miner.cfg = cfg;
         miner
     }
 
+    // Run one mining session, it fetches all addresses and available challenges, then process them one by one
+    // Caller should loop this function to have continuous mining, as new challenges will appear over time
     pub fn run(&self) -> anyhow::Result<()> {
         let addresses = fetch_addresses(self.mongo_db.as_ref().unwrap(), &self.cfg.address_id)?;
         println!("fetched {} addresses", addresses.len());
@@ -82,23 +91,58 @@ impl MidnightMiner {
             );
         }
 
-        let tasks: Vec<Task> = build_tasks(&self.cfg, challenges, addresses)?;
-        println!("total tasks to process: {}", tasks.len());
-        self.stat
-            .total_task
-            .store(tasks.len() as i32, Ordering::Relaxed);
+        self.stat.total_task.store(
+            (challenges.len() * addresses.len()) as i32,
+            Ordering::Relaxed,
+        );
 
-        self.create_monitor_thread();
+        for chall in &challenges {
+            let tasks: Vec<Task> = build_tasks(&self.cfg, chall, &addresses)?;
 
-        println!("================================");
-        println!("starting solving tasks");
-        println!("================================");
+            self.create_monitor_thread();
 
-        for mut task in tasks {
-            self.handle(&mut task);
+            println!("================================");
+            println!("starting solving chall: {}", chall.challenge.challenge_id);
+            println!("================================");
+
+            let done_adders = Miner::fetch_addresses_by_challenge_id(
+                self.mongo_db.as_ref().unwrap(),
+                &chall.challenge.challenge_id,
+            )?;
+
+            println!(
+                "chall {} already done for {} addresses, they will be skipped",
+                chall.challenge.challenge_id,
+                done_adders.len()
+            );
+
+            for mut task in tasks {
+                if done_adders.contains(&task.addr) {
+                    self.stat.skip_counter.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                self.handle(&mut task);
+            }
         }
 
         Ok(())
+    }
+
+    fn fetch_addresses_by_challenge_id(
+        db: &Database,
+        challenge_id: &str,
+    ) -> Result<HashSet<String>> {
+        let coll: Collection<Solution> = db.collection(COLL_SUBMIT);
+
+        let filter = doc! { "challenge_id": challenge_id };
+        let cursor = coll.find(filter).run()?;
+        let mut addresses = HashSet::new();
+        for result in cursor {
+            let doc = result?;
+            addresses.insert(doc.address);
+        }
+        Ok(addresses)
     }
 
     fn handle(&self, task: &mut Task) {
@@ -335,7 +379,7 @@ impl MidnightMiner {
             let mut last_total: i32 = 0;
             let mut last_time = Instant::now();
             loop {
-                thread::sleep(Duration::from_secs(10));
+                thread::sleep(Duration::from_secs(60));
                 let now = Instant::now();
                 let total_hashes = stat.hash_counter.load(Ordering::Relaxed);
                 let interval_hashes = total_hashes - last_total;
@@ -396,6 +440,15 @@ impl Solution {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Challenge {
+    challenge: ChallengeData,
+    total_challenges: i32,
+    next_challenge_starts_at: String,
+    latest_submission_epoch: i32,
+}
+
+// This is not used anymore, kept for reference
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MidnightScavengerChallenge {
     code: String,
     challenge: ChallengeData,
     mining_period_ends: String,
@@ -510,7 +563,6 @@ fn fetch_challenges(db: &Database, done_chall: &Vec<String>, limit: i64) -> Resu
 
     let filter = doc! {
         "_id": { "$nin": done_chall },
-        "code": "active",
         "latest_submission_epoch": { "$gt": Bson::Int64(time_limit) }
     };
 
@@ -530,33 +582,21 @@ fn fetch_challenges(db: &Database, done_chall: &Vec<String>, limit: i64) -> Resu
     Ok(challenges)
 }
 
-fn build_tasks(
-    cfg: &Config,
-    challenges: Vec<Challenge>,
-    addresses: Vec<String>,
-) -> Result<Vec<Task>> {
-    let mut rom_cache: HashMap<String, Arc<Rom>> = HashMap::new();
-
+fn build_tasks(cfg: &Config, challenge: &Challenge, addresses: &Vec<String>) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
-    for challenge in challenges {
-        let key = challenge.challenge.no_pre_mine.clone();
-        let rom = rom_cache
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(create_rom(&key)))
-            .clone();
+    let rom = Arc::new(create_rom(&challenge.challenge.no_pre_mine));
 
-        for addr in &addresses {
-            let mut task = Task {
-                cfg: cfg.clone(),
-                rom: rom.clone(),
-                addr: addr.clone(),
-                challenge: challenge.clone(),
-                solution: Solution::default(),
-            };
-            task.solution = build_base_solution(&task);
+    for addr in addresses {
+        let mut task = Task {
+            cfg: cfg.clone(),
+            rom: rom.clone(),
+            addr: addr.clone(),
+            challenge: challenge.clone(),
+            solution: Solution::default(),
+        };
+        task.solution = build_base_solution(&task);
 
-            tasks.push(task);
-        }
+        tasks.push(task);
     }
 
     Ok(tasks)

@@ -4,17 +4,12 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() != 2 {
-        println!("Usage: need exactly 1 arguments, got {}", args.len() - 1);
-        std::process::exit(1);
-    }
-
-    let instance_id = args[1].clone();
+    let instance_id = env::args().nth(1).unwrap_or_else(|| "default".to_string());
     println!("instance_id: {}", instance_id);
 
-    let m = miner::MidnightMiner::new(&instance_id);
+    let mongo_url = env::var("MONGO_URL").expect("MONGO_URL not set");
+
+    let m = miner::Miner::new(&instance_id, &mongo_url);
     loop {
         println!("================================");
         println!("starting a new run");
