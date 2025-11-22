@@ -78,18 +78,6 @@ pub struct Address {
     pub address: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct Config {
-    #[serde(rename = "_id")]
-    pub id: String,
-    pub address_id: String,
-    pub num_threads: i32,
-    pub self_submit: bool,
-    pub submitter_id: String,
-    pub timeout_sec: i32,
-    pub max_hash_count: i32,
-}
-
 #[derive(Clone)]
 pub struct Task {
     pub rom: Arc<Rom>,

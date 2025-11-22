@@ -8,6 +8,7 @@ use mongodb::bson::Bson;
 use mongodb::bson::doc;
 use mongodb::sync::{Collection, Database};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,35 +17,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use types::*;
 use utils::*;
 
-const MONGO_DB: &str = "defensio";
-const COLL_CONFIG: &str = "config";
-const COLL_CHALLENGES: &str = "challenge";
-const COLL_ADDRESSES: &str = "address";
-const COLL_SUBMIT: &str = "submit";
-
 pub struct Miner {
     cfg: Config,
+    mongo_cfg: MongodbConfig,
     stat: Arc<Stat>,
     mongo_client: Option<mongodb::sync::Client>,
     mongo_db: Option<mongodb::sync::Database>,
     coll_submit: Option<Collection<Solution>>,
 }
 
-// This stat mixes both per-task and overall stats,
-// it's a mess, but it works
-struct Stat {
-    start_time: AtomicI32,
-    hash_counter: AtomicI32,
-    success_counter: AtomicI32,
-    skip_counter: AtomicI32,
-    error_counter: AtomicI32,
-    total_task: AtomicI32,
-}
-
 impl Miner {
-    pub fn new(instance_id: &str, mongo_url: &str) -> Self {
+    pub fn new(instance_id: &str, mongodb_config: MongodbConfig) -> Self {
         let mut miner = Miner {
             cfg: Config::default(),
+            mongo_cfg: mongodb_config,
             mongo_client: None,
             coll_submit: None,
             mongo_db: None,
@@ -59,12 +45,26 @@ impl Miner {
         };
 
         miner.mongo_client = Some(
-            mongodb::sync::Client::with_uri_str(mongo_url).expect("failed to init mongo client"),
+            mongodb::sync::Client::with_uri_str(&miner.mongo_cfg.mongo_url)
+                .expect("failed to init mongo client"),
         );
-        miner.mongo_db = Some(miner.mongo_client.as_ref().unwrap().database(MONGO_DB));
-        miner.coll_submit = Some(miner.mongo_db.as_ref().unwrap().collection(COLL_SUBMIT));
+        miner.mongo_db = Some(
+            miner
+                .mongo_client
+                .as_ref()
+                .unwrap()
+                .database(&miner.mongo_cfg.mongo_db),
+        );
+        miner.coll_submit = Some(
+            miner
+                .mongo_db
+                .as_ref()
+                .unwrap()
+                .collection(&miner.mongo_cfg.coll_submit),
+        );
 
-        let mut cfg = Miner::fetch_config(miner.mongo_db.as_ref().unwrap(), &instance_id)
+        let mut cfg = miner
+            .fetch_config(miner.mongo_db.as_ref().unwrap(), &instance_id)
             .expect("failed to fetch config");
 
         if cfg.num_threads <= 0 {
@@ -83,10 +83,10 @@ impl Miner {
     // Caller should loop this function to have continuous mining, as new challenges will appear over time
     pub fn run(&self) -> anyhow::Result<()> {
         let addresses =
-            Miner::fetch_addresses(self.mongo_db.as_ref().unwrap(), &self.cfg.address_id)?;
+            self.fetch_addresses(self.mongo_db.as_ref().unwrap(), &self.cfg.address_id)?;
         println!("fetched {} addresses", addresses.len());
 
-        let challenges = Miner::fetch_challenges(self.mongo_db.as_ref().unwrap(), &vec![], 1000)?;
+        let challenges = self.fetch_challenges(self.mongo_db.as_ref().unwrap(), &vec![], 1000)?;
         println!("fetched {} challenges", challenges.len());
 
         for chall in &challenges {
@@ -101,16 +101,16 @@ impl Miner {
             Ordering::Relaxed,
         );
 
+        self.create_monitor_thread();
+
         for chall in &challenges {
             let tasks: Vec<Task> = self.build_tasks(chall, &addresses)?;
-
-            self.create_monitor_thread();
 
             println!("================================");
             println!("starting solving chall: {}", chall.challenge.challenge_id);
             println!("================================");
 
-            let done_adders = Miner::fetch_done_addresses(
+            let done_adders = self.fetch_done_addresses(
                 self.mongo_db.as_ref().unwrap(),
                 &chall.challenge.challenge_id,
             )?;
@@ -401,8 +401,8 @@ impl Miner {
     // Helper functions
     //
 
-    fn fetch_config(db: &Database, instance_id: &str) -> Result<Config> {
-        let coll: Collection<Config> = db.collection(COLL_CONFIG);
+    fn fetch_config(&self, db: &Database, instance_id: &str) -> Result<Config> {
+        let coll: Collection<Config> = db.collection(&self.mongo_cfg.coll_config);
 
         let filter = doc! { "_id": instance_id };
         let result = coll.find_one(filter).run()?;
@@ -419,8 +419,8 @@ impl Miner {
         Ok(cfg)
     }
 
-    fn fetch_addresses(db: &Database, address_id: &str) -> Result<Vec<String>> {
-        let coll: Collection<Address> = db.collection(COLL_ADDRESSES);
+    fn fetch_addresses(&self, db: &Database, address_id: &str) -> Result<Vec<String>> {
+        let coll: Collection<Address> = db.collection(&self.mongo_cfg.coll_address);
 
         let filter = doc! { "tag": address_id };
         let cursor = coll.find(filter).run()?;
@@ -433,6 +433,7 @@ impl Miner {
     }
 
     fn fetch_challenges(
+        &self,
         db: &Database,
         done_chall: &Vec<String>,
         limit: i64,
@@ -449,7 +450,7 @@ impl Miner {
             .limit(limit)
             .build();
 
-        let coll: Collection<Challenge> = db.collection(COLL_CHALLENGES);
+        let coll: Collection<Challenge> = db.collection(&self.mongo_cfg.coll_challenge);
         let mut cursor = coll.find(filter).with_options(find_options).run()?;
         let mut challenges = Vec::new();
 
@@ -507,8 +508,8 @@ impl Miner {
         }
     }
 
-    fn fetch_done_addresses(db: &Database, challenge_id: &str) -> Result<HashSet<String>> {
-        let coll: Collection<Solution> = db.collection(COLL_SUBMIT);
+    fn fetch_done_addresses(&self, db: &Database, challenge_id: &str) -> Result<HashSet<String>> {
+        let coll: Collection<Solution> = db.collection(&self.mongo_cfg.coll_submit);
 
         let filter = doc! { "challenge_id": challenge_id };
         let cursor = coll.find(filter).run()?;
@@ -519,4 +520,37 @@ impl Miner {
         }
         Ok(addresses)
     }
+}
+
+// This stat mixes both per-task and overall stats,
+// it's a mess, but it works
+struct Stat {
+    start_time: AtomicI32,
+    hash_counter: AtomicI32,
+    success_counter: AtomicI32,
+    skip_counter: AtomicI32,
+    error_counter: AtomicI32,
+    total_task: AtomicI32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct Config {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub address_id: String,
+    pub num_threads: i32,
+    pub self_submit: bool,
+    pub submitter_id: String,
+    pub timeout_sec: i32,
+    pub max_hash_count: i32,
+}
+
+#[derive(Debug)]
+pub struct MongodbConfig {
+    pub mongo_url: String,
+    pub mongo_db: String,
+    pub coll_config: String,
+    pub coll_challenge: String,
+    pub coll_address: String,
+    pub coll_submit: String,
 }

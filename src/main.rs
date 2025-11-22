@@ -9,7 +9,16 @@ fn main() -> anyhow::Result<()> {
 
     let mongo_url = env::var("MONGO_URL").expect("MONGO_URL not set");
 
-    let m = miner::Miner::new(&instance_id, &mongo_url);
+    let mongodb_config = miner::MongodbConfig {
+        mongo_url: mongo_url.clone(),
+        mongo_db: "defensio".to_string(),
+        coll_config: "config".to_string(),
+        coll_challenge: "challenge".to_string(),
+        coll_address: "address".to_string(),
+        coll_submit: "submit".to_string(),
+    };
+
+    let m = miner::Miner::new(&instance_id, mongodb_config);
     loop {
         println!("================================");
         println!("starting a new run");
