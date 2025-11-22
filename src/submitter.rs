@@ -31,6 +31,8 @@ impl Submitter {
     }
 
     pub fn run(&self) -> anyhow::Result<()> {
+        println!("Submitter started");
+
         let mut last_chall_update = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -42,9 +44,26 @@ impl Submitter {
                 .unwrap()
                 .as_secs();
 
-            if now - last_chall_update > 60 {
-                self.fetch_and_update_challenge()?;
+            if now - last_chall_update > 5 {
+                match self.fetch_and_update_challenge() {
+                    Ok(challenge) => {
+                        println!(
+                            "Fetched/wrote to db challenge {}, diff {}",
+                            challenge.id, challenge.challenge.difficulty,
+                        );
+                    }
+                    Err(e) => {
+                        if !e.to_string().contains("duplicate key error") {
+                            println!("Error fetching/updating challenge: {:?}", e);
+                        }
+                    }
+                }
+
                 last_chall_update = now;
+            }
+
+            if let Err(err) = self.submit_solution_and_record() {
+                println!("Error submitting solutions: {:?}", err);
             }
 
             std::thread::sleep(std::time::Duration::from_secs(1)); // traffic is low, no rush
@@ -55,29 +74,6 @@ impl Submitter {
         let challenge = self.fetch_challenge()?;
         self.write_challenge(&challenge)?;
         Ok(challenge)
-    }
-
-    pub fn submit_solution_and_record(&self) -> anyhow::Result<()> {
-        let filter = doc! { "status": "found" };
-        let cursor = self.coll_submit.find(filter).run()?;
-        for result in cursor {
-            let doc = result?;
-            let submit_resp = self.submit_solution(&doc)?;
-            println!("Submitted solution: {:?}", submit_resp);
-            let update = doc! {
-                "$set": {
-                    "status": "submitted",
-                    "submitted_time": time_to_string(&Utc::now()),
-                    "submit_response": serde_json::to_string(&submit_resp)?,
-                }
-            };
-            self.coll_submit
-                .update_one(doc! { "_id": doc.id }, update)
-                .run()?;
-
-            std::thread::sleep(std::time::Duration::from_secs(1)); // traffic is low, no rush
-        }
-        Ok(())
     }
 
     pub fn fetch_challenge(&self) -> anyhow::Result<Challenge> {
@@ -96,6 +92,45 @@ impl Submitter {
 
     pub fn write_challenge(&self, challenge: &Challenge) -> anyhow::Result<()> {
         self.coll_challenge.insert_one(challenge).run()?;
+        Ok(())
+    }
+
+    pub fn submit_solution_and_record(&self) -> anyhow::Result<()> {
+        let filter = doc! { "status": "found" };
+        let cursor = self.coll_submit.find(filter).run()?;
+        for result in cursor {
+            let doc = result?;
+
+            match self.submit_solution(&doc) {
+                Ok(resp) => {
+                    let update = doc! {
+                        "$set": {
+                            "status": "submitted",
+                            "submitted_time": time_to_string(&Utc::now()),
+                            "submit_response": mongodb::bson::to_bson(&resp)?,
+                        }
+                    };
+                    self.coll_submit
+                        .update_one(doc! { "_id": &doc.id }, update)
+                        .run()?;
+
+                    println!("Submitted {}", &doc.id);
+                }
+                Err(e) => {
+                    println!("Error submitting solution: {:?}", e);
+                    let update = doc! {
+                        "$set": {
+                            "status": e.to_string(),
+                        }
+                    };
+                    self.coll_submit
+                        .update_one(doc! { "_id": doc.id }, update)
+                        .run()?;
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(1)); // traffic is low, no rush
+        }
         Ok(())
     }
 

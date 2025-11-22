@@ -6,10 +6,11 @@
 
 The goal is to provide a **distributed, stateless, and easily scalable** mining setup
 
-This repository contains only the **worker** component. To run the full system, you will also need:
+To run the full system, you will need:
 
-- **MongoDB**
-- **A submitter service**
+- One mongoDB, submitter and workers must be able to reach this
+- One submitter service
+- Multiple workers
 
 ## How it works (Stateless & Horizontally Scalable)
 ```
