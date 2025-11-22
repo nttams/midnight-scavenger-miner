@@ -1,16 +1,20 @@
+mod types;
+mod utils;
+
 use anyhow::Result;
 use ashmaize::*;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use mongodb::bson::Bson;
 use mongodb::bson::doc;
 use mongodb::sync::{Collection, Database};
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use types::*;
+use utils::*;
 
 const MONGO_DB: &str = "defensio";
 const COLL_CONFIG: &str = "config";
@@ -60,7 +64,7 @@ impl Miner {
         miner.mongo_db = Some(miner.mongo_client.as_ref().unwrap().database(MONGO_DB));
         miner.coll_submit = Some(miner.mongo_db.as_ref().unwrap().collection(COLL_SUBMIT));
 
-        let mut cfg = fetch_config(miner.mongo_db.as_ref().unwrap(), &instance_id)
+        let mut cfg = Miner::fetch_config(miner.mongo_db.as_ref().unwrap(), &instance_id)
             .expect("failed to fetch config");
 
         if cfg.num_threads <= 0 {
@@ -78,10 +82,11 @@ impl Miner {
     // Run one mining session, it fetches all addresses and available challenges, then process them one by one
     // Caller should loop this function to have continuous mining, as new challenges will appear over time
     pub fn run(&self) -> anyhow::Result<()> {
-        let addresses = fetch_addresses(self.mongo_db.as_ref().unwrap(), &self.cfg.address_id)?;
+        let addresses =
+            Miner::fetch_addresses(self.mongo_db.as_ref().unwrap(), &self.cfg.address_id)?;
         println!("fetched {} addresses", addresses.len());
 
-        let challenges = fetch_challenges(self.mongo_db.as_ref().unwrap(), &vec![], 1000)?;
+        let challenges = Miner::fetch_challenges(self.mongo_db.as_ref().unwrap(), &vec![], 1000)?;
         println!("fetched {} challenges", challenges.len());
 
         for chall in &challenges {
@@ -97,7 +102,7 @@ impl Miner {
         );
 
         for chall in &challenges {
-            let tasks: Vec<Task> = build_tasks(&self.cfg, chall, &addresses)?;
+            let tasks: Vec<Task> = self.build_tasks(chall, &addresses)?;
 
             self.create_monitor_thread();
 
@@ -105,7 +110,7 @@ impl Miner {
             println!("starting solving chall: {}", chall.challenge.challenge_id);
             println!("================================");
 
-            let done_adders = Miner::fetch_addresses_by_challenge_id(
+            let done_adders = Miner::fetch_done_addresses(
                 self.mongo_db.as_ref().unwrap(),
                 &chall.challenge.challenge_id,
             )?;
@@ -127,22 +132,6 @@ impl Miner {
         }
 
         Ok(())
-    }
-
-    fn fetch_addresses_by_challenge_id(
-        db: &Database,
-        challenge_id: &str,
-    ) -> Result<HashSet<String>> {
-        let coll: Collection<Solution> = db.collection(COLL_SUBMIT);
-
-        let filter = doc! { "challenge_id": challenge_id };
-        let cursor = coll.find(filter).run()?;
-        let mut addresses = HashSet::new();
-        for result in cursor {
-            let doc = result?;
-            addresses.insert(doc.address);
-        }
-        Ok(addresses)
     }
 
     fn handle(&self, task: &mut Task) {
@@ -236,7 +225,7 @@ impl Miner {
             task.solution.total_hashes
         );
 
-        let status = if task.cfg.self_submit {
+        let status = if self.cfg.self_submit {
             "found_self_submit"
         } else {
             "found"
@@ -274,7 +263,7 @@ impl Miner {
             let stop_flag = Arc::new(AtomicBool::new(false));
             let solution_slot = Arc::new(Mutex::new(None));
 
-            for _ in 0..task.cfg.num_threads {
+            for _ in 0..self.cfg.num_threads {
                 let stop_flag = Arc::clone(&stop_flag);
                 let solution_slot = Arc::clone(&solution_slot);
 
@@ -359,13 +348,13 @@ impl Miner {
                 last_report = Instant::now();
 
                 // Check timeout
-                if start.elapsed() >= Duration::from_secs(task.cfg.timeout_sec as u64) {
+                if start.elapsed() >= Duration::from_secs(self.cfg.timeout_sec as u64) {
                     stop_flag.store(true, Ordering::Relaxed);
                     break;
                 }
 
                 // Check hash count limit
-                if self.stat.hash_counter.load(Ordering::Relaxed) >= task.cfg.max_hash_count {
+                if self.stat.hash_counter.load(Ordering::Relaxed) >= self.cfg.max_hash_count {
                     stop_flag.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -407,261 +396,127 @@ impl Miner {
             }
         });
     }
-}
 
-//
-// Types
-//
+    //
+    // Helper functions
+    //
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-struct Solution {
-    #[serde(rename = "_id")]
-    id: String, // challenge_id:address
-    instance_id: String,
-    challenge_id: String,
-    address: String,
-    nonce: String,
-    hash: String,
-    preimage: String,
-    create_time: DateTime<Utc>,
-    found_time: DateTime<Utc>,
-    submitted_time: DateTime<Utc>,
-    time_taken_sec: i32,
-    total_hashes: i32,
-    status: String, // "onit" | "found" | "submitted"
-    submitter_id: String,
-}
+    fn fetch_config(db: &Database, instance_id: &str) -> Result<Config> {
+        let coll: Collection<Config> = db.collection(COLL_CONFIG);
 
-impl Solution {
-    fn is_empty(&self) -> bool {
-        self.nonce.is_empty() || self.hash.is_empty() || self.preimage.is_empty()
-    }
-}
+        let filter = doc! { "_id": instance_id };
+        let result = coll.find_one(filter).run()?;
+        let mut cfg =
+            result.ok_or_else(|| anyhow::anyhow!("No config for instance '{}'", instance_id))?;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Challenge {
-    challenge: ChallengeData,
-    total_challenges: i32,
-    next_challenge_starts_at: String,
-    latest_submission_epoch: i32,
-}
-
-// This is not used anymore, kept for reference
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct MidnightScavengerChallenge {
-    code: String,
-    challenge: ChallengeData,
-    mining_period_ends: String,
-    max_day: i32,
-    total_challenges: i32,
-    current_day: i32,
-    next_challenge_starts_at: String,
-    latest_submission_epoch: i32,
-}
-
-impl Challenge {
-    fn is_late(&self, minute: i64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        self.latest_submission_epoch as i64 - now <= minute * 60 // less than x minutes left
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ChallengeData {
-    challenge_id: String,
-    challenge_number: i32,
-    day: i32,
-    issued_at: String,
-    latest_submission: String,
-    difficulty: String,
-    no_pre_mine: String,
-    no_pre_mine_hour: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Address {
-    tag: String,
-    address: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-struct Config {
-    #[serde(rename = "_id")]
-    id: String,
-    address_id: String,
-    num_threads: i32,
-    self_submit: bool,
-    submitter_id: String,
-    timeout_sec: i32,
-    max_hash_count: i32,
-}
-
-#[derive(Clone)]
-struct Task {
-    cfg: Config,
-    rom: Arc<Rom>,
-    addr: String,
-    challenge: Challenge,
-    solution: Solution,
-}
-
-//
-// Helper functions
-//
-
-fn create_rom(no_pre_mine: &str) -> Rom {
-    const MB: usize = 1024 * 1024;
-    const GB: usize = 1024 * MB;
-
-    let rom = Rom::new(
-        no_pre_mine.as_bytes(),
-        RomGenerationType::TwoStep {
-            pre_size: 16 * MB,
-            mixing_numbers: 4,
-        },
-        1 * GB,
-    );
-    rom
-}
-
-fn fetch_config(db: &Database, instance_id: &str) -> Result<Config> {
-    let coll: Collection<Config> = db.collection(COLL_CONFIG);
-
-    let filter = doc! { "_id": instance_id };
-    let result = coll.find_one(filter).run()?;
-    let mut cfg =
-        result.ok_or_else(|| anyhow::anyhow!("No config for instance '{}'", instance_id))?;
-
-    if cfg.timeout_sec <= 0 {
-        cfg.timeout_sec = 60 * 60;
-    }
-    if cfg.max_hash_count <= 0 {
-        cfg.max_hash_count = 10_000_000;
-    }
-
-    Ok(cfg)
-}
-
-fn fetch_addresses(db: &Database, address_id: &str) -> Result<Vec<String>> {
-    let coll: Collection<Address> = db.collection(COLL_ADDRESSES);
-
-    let filter = doc! { "tag": address_id };
-    let cursor = coll.find(filter).run()?;
-    let mut addresses = Vec::new();
-    for result in cursor {
-        let doc = result?;
-        addresses.push(doc.address);
-    }
-    Ok(addresses)
-}
-
-fn fetch_challenges(db: &Database, done_chall: &Vec<String>, limit: i64) -> Result<Vec<Challenge>> {
-    let time_limit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64 + 3600;
-
-    let filter = doc! {
-        "_id": { "$nin": done_chall },
-        "latest_submission_epoch": { "$gt": Bson::Int64(time_limit) }
-    };
-
-    let find_options = mongodb::options::FindOptions::builder()
-        .sort(doc! { "latest_submission_epoch": 1 }) // oldest first
-        .limit(limit)
-        .build();
-
-    let coll: Collection<Challenge> = db.collection(COLL_CHALLENGES);
-    let mut cursor = coll.find(filter).with_options(find_options).run()?;
-    let mut challenges = Vec::new();
-
-    while let Some(challenge) = cursor.next() {
-        challenges.push(challenge?);
-    }
-
-    Ok(challenges)
-}
-
-fn build_tasks(cfg: &Config, challenge: &Challenge, addresses: &Vec<String>) -> Result<Vec<Task>> {
-    let mut tasks = Vec::new();
-    let rom = Arc::new(create_rom(&challenge.challenge.no_pre_mine));
-
-    for addr in addresses {
-        let mut task = Task {
-            cfg: cfg.clone(),
-            rom: rom.clone(),
-            addr: addr.clone(),
-            challenge: challenge.clone(),
-            solution: Solution::default(),
-        };
-        task.solution = build_base_solution(&task);
-
-        tasks.push(task);
-    }
-
-    Ok(tasks)
-}
-
-fn build_base_solution(task: &Task) -> Solution {
-    Solution {
-        id: format!(
-            "{}:{}",
-            task.challenge.challenge.challenge_id,
-            shorten_address(&task.addr)
-        ),
-        instance_id: task.cfg.id.clone(),
-        challenge_id: task.challenge.challenge.challenge_id.clone(),
-        address: task.addr.clone(),
-        nonce: "".to_string(),
-        hash: "".to_string(),
-        preimage: "".to_string(),
-        create_time: Utc::now(),
-        found_time: Default::default(),
-        submitted_time: Default::default(),
-        time_taken_sec: 0,
-        total_hashes: 0,
-        submitter_id: task.cfg.submitter_id.clone(),
-        status: if task.cfg.self_submit {
-            "onit_self_submit"
-        } else {
-            "onit"
+        if cfg.timeout_sec <= 0 {
+            cfg.timeout_sec = 60 * 60;
         }
-        .to_string(),
-    }
-}
+        if cfg.max_hash_count <= 0 {
+            cfg.max_hash_count = 10_000_000;
+        }
 
-fn format_duration(mut seconds: i32) -> String {
-    let hours = seconds / 3600;
-    seconds %= 3600;
-    let minutes = seconds / 60;
-    seconds %= 60;
-
-    let mut result = String::new();
-    if hours > 0 {
-        result.push_str(&format!("{}h", hours));
-    }
-    if minutes > 0 {
-        result.push_str(&format!("{}m", minutes));
-    }
-    if seconds > 0 || result.is_empty() {
-        result.push_str(&format!("{}s", seconds));
+        Ok(cfg)
     }
 
-    result
-}
+    fn fetch_addresses(db: &Database, address_id: &str) -> Result<Vec<String>> {
+        let coll: Collection<Address> = db.collection(COLL_ADDRESSES);
 
-fn shorten_address(addr: &String) -> String {
-    if addr.len() <= 24 {
-        return addr.clone();
+        let filter = doc! { "tag": address_id };
+        let cursor = coll.find(filter).run()?;
+        let mut addresses = Vec::new();
+        for result in cursor {
+            let doc = result?;
+            addresses.push(doc.address);
+        }
+        Ok(addresses)
     }
 
-    let prefix_len = 10;
-    let suffix_len = 5;
-    let start = &addr[..prefix_len];
-    let end = &addr[addr.len() - suffix_len..];
-    format!("{}...{}", start, end)
-}
+    fn fetch_challenges(
+        db: &Database,
+        done_chall: &Vec<String>,
+        limit: i64,
+    ) -> Result<Vec<Challenge>> {
+        let time_limit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64 + 3600;
 
-fn time_to_string(t: &DateTime<Utc>) -> String {
-    return t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let filter = doc! {
+            "_id": { "$nin": done_chall },
+            "latest_submission_epoch": { "$gt": Bson::Int64(time_limit) }
+        };
+
+        let find_options = mongodb::options::FindOptions::builder()
+            .sort(doc! { "latest_submission_epoch": 1 }) // oldest first
+            .limit(limit)
+            .build();
+
+        let coll: Collection<Challenge> = db.collection(COLL_CHALLENGES);
+        let mut cursor = coll.find(filter).with_options(find_options).run()?;
+        let mut challenges = Vec::new();
+
+        while let Some(challenge) = cursor.next() {
+            challenges.push(challenge?);
+        }
+
+        Ok(challenges)
+    }
+
+    fn build_tasks(&self, challenge: &Challenge, addresses: &Vec<String>) -> Result<Vec<Task>> {
+        let mut tasks = Vec::new();
+        let rom = Arc::new(create_rom(&challenge.challenge.no_pre_mine));
+
+        for addr in addresses {
+            let mut task = Task {
+                rom: rom.clone(),
+                addr: addr.clone(),
+                challenge: challenge.clone(),
+                solution: Solution::default(),
+            };
+            task.solution = self.build_base_solution(&task);
+
+            tasks.push(task);
+        }
+
+        Ok(tasks)
+    }
+
+    fn build_base_solution(&self, task: &Task) -> Solution {
+        Solution {
+            id: format!(
+                "{}:{}",
+                task.challenge.challenge.challenge_id,
+                shorten_address(&task.addr)
+            ),
+            instance_id: self.cfg.id.clone(),
+            challenge_id: task.challenge.challenge.challenge_id.clone(),
+            address: task.addr.clone(),
+            nonce: "".to_string(),
+            hash: "".to_string(),
+            preimage: "".to_string(),
+            create_time: Utc::now(),
+            found_time: Default::default(),
+            submitted_time: Default::default(),
+            time_taken_sec: 0,
+            total_hashes: 0,
+            submitter_id: self.cfg.submitter_id.clone(),
+            status: if self.cfg.self_submit {
+                "onit_self_submit"
+            } else {
+                "onit"
+            }
+            .to_string(),
+        }
+    }
+
+    fn fetch_done_addresses(db: &Database, challenge_id: &str) -> Result<HashSet<String>> {
+        let coll: Collection<Solution> = db.collection(COLL_SUBMIT);
+
+        let filter = doc! { "challenge_id": challenge_id };
+        let cursor = coll.find(filter).run()?;
+        let mut addresses = HashSet::new();
+        for result in cursor {
+            let doc = result?;
+            addresses.insert(doc.address);
+        }
+        Ok(addresses)
+    }
 }
