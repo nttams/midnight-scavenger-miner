@@ -7,8 +7,11 @@ use mongodb::bson::doc;
 use mongodb::sync::Collection;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use std::sync::Arc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
 pub struct Submitter {
     cfg: Config,
     client: Client,
@@ -30,44 +33,62 @@ impl Submitter {
         }
     }
 
-    pub fn run(&self) -> anyhow::Result<()> {
+    pub fn run(self) -> anyhow::Result<()> {
         println!("Submitter started");
 
-        let mut last_chall_update = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let this = Arc::new(self.clone());
 
-        loop {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+        let t1 = {
+            let s = Arc::clone(&this);
+            thread::spawn(move || {
+                let mut last_chall_update = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
 
-            if now - last_chall_update > 5 {
-                match self.fetch_and_update_challenge() {
-                    Ok(challenge) => {
-                        println!(
-                            "Fetched/wrote to db challenge {}, diff {}",
-                            challenge.id, challenge.challenge.difficulty,
-                        );
-                    }
-                    Err(e) => {
-                        if !e.to_string().contains("duplicate key error") {
-                            println!("Error fetching/updating challenge: {:?}", e);
+                loop {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+
+                    if now - last_chall_update > 5 {
+                        match s.fetch_and_update_challenge() {
+                            Ok(challenge) => {
+                                println!(
+                                    "Fetched/wrote to db challenge {}, diff {}",
+                                    challenge.id, challenge.challenge.difficulty,
+                                );
+                            }
+                            Err(e) => {
+                                if !e.to_string().contains("duplicate key error") {
+                                    println!("Error fetching/updating challenge: {:?}", e);
+                                }
+                            }
                         }
+
+                        last_chall_update = now;
                     }
                 }
+            })
+        };
 
-                last_chall_update = now;
-            }
+        {
+            let s = Arc::clone(&this);
+            thread::spawn(move || {
+                loop {
+                    if let Err(err) = s.submit_solution_and_record() {
+                        println!("Error submitting solutions: {:?}", err);
+                    }
 
-            if let Err(err) = self.submit_solution_and_record() {
-                println!("Error submitting solutions: {:?}", err);
-            }
+                    std::thread::sleep(std::time::Duration::from_secs(1)); // traffic is low, no rush
+                }
+            })
+        };
 
-            std::thread::sleep(std::time::Duration::from_secs(1)); // traffic is low, no rush
-        }
+        t1.join().unwrap();
+
+        Ok(())
     }
 
     pub fn fetch_and_update_challenge(&self) -> anyhow::Result<Challenge> {
@@ -160,6 +181,7 @@ impl Submitter {
     }
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub base_url: String,
 }
