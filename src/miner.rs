@@ -93,21 +93,20 @@ impl Miner {
             );
         }
 
-        self.stat.total_task.store(
-            (challenges.len() * addresses.len()) as i32,
-            Ordering::Relaxed,
-        );
-
         self.create_monitor_thread();
 
         for chall in &challenges {
             let tasks: Vec<Task> = self.build_tasks(chall, &addresses)?;
 
+            self.stat
+                .total_task
+                .store(tasks.len() as i32, Ordering::Relaxed);
+
             println!("================================");
             println!("starting solving chall: {}", chall.challenge.challenge_id);
             println!("================================");
 
-            let done_adders = self.fetch_done_addresses(
+            let done_addresses = self.fetch_done_addresses(
                 self.mongo_db.as_ref().unwrap(),
                 &chall.challenge.challenge_id,
             )?;
@@ -115,52 +114,49 @@ impl Miner {
             println!(
                 "chall {} already done for {} addresses, they will be skipped",
                 chall.challenge.challenge_id,
-                done_adders.len()
+                done_addresses.len()
             );
 
             for mut task in tasks {
-                if done_adders.contains(&task.addr) {
+                if done_addresses.contains(&task.addr) {
                     self.stat.skip_counter.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
-                self.handle(&mut task);
+                self.stat.hash_counter.store(0, Ordering::Relaxed);
+                self.stat.start_time.store(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i32,
+                    Ordering::Relaxed,
+                );
+
+                if let Err(e) = self.handle_task(&mut task) {
+                    if e.to_string().contains("duplicate key error") {
+                        println!(
+                            "⏩ Skip {}:{}, claimed by others or solution is found",
+                            task.challenge.challenge.challenge_id,
+                            shorten_address(&task.addr)
+                        );
+                        self.stat.skip_counter.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    println!(
+                        "❌ Error {}{}: {}",
+                        task.challenge.challenge.challenge_id,
+                        shorten_address(&task.addr),
+                        e
+                    );
+                    self.stat.error_counter.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                self.stat.success_counter.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         Ok(())
-    }
-
-    fn handle(&self, task: &mut Task) {
-        let stat = Arc::clone(&self.stat);
-        stat.hash_counter.store(0, Ordering::Relaxed);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i32;
-        stat.start_time.store(now, Ordering::Relaxed);
-
-        if let Err(e) = self.handle_task(task) {
-            if e.to_string().contains("duplicate key error") {
-                println!(
-                    "⏩ Skip {}:{}, claimed by others or solution is found",
-                    task.challenge.challenge.challenge_id,
-                    shorten_address(&task.addr)
-                );
-                self.stat.skip_counter.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-
-            println!(
-                "❌ Error {}{}: {}",
-                task.challenge.challenge.challenge_id,
-                shorten_address(&task.addr),
-                e
-            );
-            self.stat.error_counter.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.stat.success_counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn handle_task(&self, task: &mut Task) -> Result<()> {
@@ -365,7 +361,7 @@ impl Miner {
             let mut last_total: i32 = 0;
             let mut last_time = Instant::now();
             loop {
-                thread::sleep(Duration::from_secs(60));
+                thread::sleep(Duration::from_secs(10));
                 let now = Instant::now();
                 let total_hashes = stat.hash_counter.load(Ordering::Relaxed);
                 let interval_hashes = total_hashes - last_total;
@@ -379,7 +375,7 @@ impl Miner {
                     - stat.start_time.load(Ordering::Relaxed);
 
                 println!(
-                    "⛏️ Hash rate: {:04} hashes/sec, total: {}, time_taken: {}, done: {}, skipped: {}, errors: {}. total tasks: {}",
+                    "⛏️ Rate: {:04} h/s, total: {}, time: {}, done: {}, skip: {}, errors: {}. tasks: {}",
                     rate,
                     total_hashes,
                     format_duration(time_passed),
