@@ -1,4 +1,4 @@
 pub mod miner;
 pub mod submitter;
-mod types;
-mod utils;
+pub mod types;
+pub mod utils;

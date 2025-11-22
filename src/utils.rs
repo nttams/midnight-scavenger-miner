@@ -51,3 +51,25 @@ pub fn shorten_address(addr: &String) -> String {
 pub fn time_to_string(t: &DateTime<Utc>) -> String {
     return t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 }
+
+pub fn handle_submit_error(err: &anyhow::Error) -> String {
+    let msg = err.to_string();
+
+    if msg.contains("deadline has elapsed") {
+        return "failed_to_submit_deadline_exceeded".into();
+    }
+
+    if msg.contains("timed out") || msg.contains("timeout") {
+        return "failed_to_submit_timeout".into();
+    }
+
+    if msg.contains("Solution already exists") {
+        return "failed_to_submit_solution_exists".into();
+    }
+
+    if msg.contains("Challenge window closed") {
+        return "failed_to_submit_submission_window_closed".into();
+    }
+
+    "failed_to_submit_general".into()
+}

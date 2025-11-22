@@ -1,7 +1,4 @@
-use miner::miner::*;
 use std::env;
-use std::thread;
-use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
     let instance_id = env::args().nth(1).unwrap_or_else(|| "default".to_string());
@@ -9,7 +6,7 @@ fn main() -> anyhow::Result<()> {
 
     let mongo_url = env::var("MONGO_URL").expect("MONGO_URL not set");
 
-    let mongodb_config = MongodbConfig {
+    let mongodb_config = miner::types::MongodbConfig {
         mongo_url: mongo_url.clone(),
         mongo_db: "defensio".to_string(),
         coll_config: "config".to_string(),
@@ -18,12 +15,14 @@ fn main() -> anyhow::Result<()> {
         coll_submit: "submit".to_string(),
     };
 
-    let m = Miner::new(&instance_id, mongodb_config);
-    loop {
-        println!("================================");
-        println!("starting a new run");
-        println!("================================");
-        m.run()?;
-        thread::sleep(Duration::from_millis(100));
+    if instance_id.starts_with("submitter") {
+        let submitter_cfg = miner::submitter::Config {
+            base_url: "https://mine.defensio.io/api".to_string(),
+        };
+        let submitter = miner::submitter::Submitter::new(submitter_cfg, mongodb_config);
+        return submitter.run();
     }
+
+    let m = miner::miner::Miner::new(&instance_id, mongodb_config);
+    m.start_mining()
 }

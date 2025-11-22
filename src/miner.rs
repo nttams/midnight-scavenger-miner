@@ -1,11 +1,10 @@
 use crate::types::*;
 use crate::utils::*;
-use anyhow::Result;
 use ashmaize::*;
 use chrono::Utc;
 use mongodb::bson::Bson;
 use mongodb::bson::doc;
-use mongodb::sync::{Collection, Database};
+use mongodb::sync::Collection;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -16,21 +15,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Miner {
     cfg: Config,
-    mongo_cfg: MongodbConfig,
     stat: Arc<Stat>,
-    mongo_client: Option<mongodb::sync::Client>,
-    mongo_db: Option<mongodb::sync::Database>,
-    coll_submit: Option<Collection<Solution>>,
+    coll_config: Collection<Config>,
+    coll_address: Collection<Address>,
+    coll_challenge: Collection<Challenge>,
+    coll_submit: Collection<Solution>,
 }
 
 impl Miner {
     pub fn new(instance_id: &str, mongodb_config: MongodbConfig) -> Self {
+        let mongo_client = mongodb::sync::Client::with_uri_str(&mongodb_config.mongo_url)
+            .expect("failed to init mongo client");
+        let mongo_db = mongo_client.database(&mongodb_config.mongo_db);
+
         let mut miner = Miner {
             cfg: Config::default(),
-            mongo_cfg: mongodb_config,
-            mongo_client: None,
-            coll_submit: None,
-            mongo_db: None,
+            coll_submit: mongo_db.collection(&mongodb_config.coll_submit),
+            coll_config: mongo_db.collection(&mongodb_config.coll_config),
+            coll_address: mongo_db.collection(&mongodb_config.coll_address),
+            coll_challenge: mongo_db.collection(&mongodb_config.coll_challenge),
             stat: Arc::new(Stat {
                 start_time: AtomicI32::new(0),
                 hash_counter: AtomicI32::new(0),
@@ -41,27 +44,8 @@ impl Miner {
             }),
         };
 
-        miner.mongo_client = Some(
-            mongodb::sync::Client::with_uri_str(&miner.mongo_cfg.mongo_url)
-                .expect("failed to init mongo client"),
-        );
-        miner.mongo_db = Some(
-            miner
-                .mongo_client
-                .as_ref()
-                .unwrap()
-                .database(&miner.mongo_cfg.mongo_db),
-        );
-        miner.coll_submit = Some(
-            miner
-                .mongo_db
-                .as_ref()
-                .unwrap()
-                .collection(&miner.mongo_cfg.coll_submit),
-        );
-
         let mut cfg = miner
-            .fetch_config(miner.mongo_db.as_ref().unwrap(), &instance_id)
+            .fetch_config(&instance_id)
             .expect("failed to fetch config");
 
         if cfg.num_threads <= 0 {
@@ -72,18 +56,29 @@ impl Miner {
             cfg.num_threads = 1; // fallback
         }
 
+        println!("config: {}", serde_json::to_string_pretty(&cfg).unwrap());
+
         miner.cfg = cfg;
         miner
+    }
+
+    pub fn start_mining(&self) -> anyhow::Result<()> {
+        loop {
+            println!("================================");
+            println!("starting a new run");
+            println!("================================");
+            self.run()?;
+            thread::sleep(Duration::from_millis(1000));
+        }
     }
 
     // Run one mining session, it fetches all addresses and available challenges, then process them one by one
     // Caller should loop this function to have continuous mining, as new challenges will appear over time
     pub fn run(&self) -> anyhow::Result<()> {
-        let addresses =
-            self.fetch_addresses(self.mongo_db.as_ref().unwrap(), &self.cfg.address_id)?;
+        let addresses = self.fetch_addresses(&self.cfg.address_id)?;
         println!("fetched {} addresses", addresses.len());
 
-        let challenges = self.fetch_challenges(self.mongo_db.as_ref().unwrap(), &vec![], 1000)?;
+        let challenges = self.fetch_challenges(&vec![], 1000)?;
         println!("fetched {} challenges", challenges.len());
 
         for chall in &challenges {
@@ -106,10 +101,7 @@ impl Miner {
             println!("starting solving chall: {}", chall.challenge.challenge_id);
             println!("================================");
 
-            let done_addresses = self.fetch_done_addresses(
-                self.mongo_db.as_ref().unwrap(),
-                &chall.challenge.challenge_id,
-            )?;
+            let done_addresses = self.fetch_done_addresses(&chall.challenge.challenge_id)?;
 
             println!(
                 "chall {} already done for {} addresses, they will be skipped",
@@ -159,7 +151,7 @@ impl Miner {
         Ok(())
     }
 
-    fn handle_task(&self, task: &mut Task) -> Result<()> {
+    fn handle_task(&self, task: &mut Task) -> anyhow::Result<()> {
         let challenge_id = task.challenge.challenge.challenge_id.clone();
         let addr_short = shorten_address(&task.addr);
 
@@ -180,11 +172,7 @@ impl Miner {
         }
 
         // Claim a slot in db, so other instances won't work on same challenge:address
-        self.coll_submit
-            .as_ref()
-            .unwrap()
-            .insert_one(&task.solution)
-            .run()?;
+        self.coll_submit.insert_one(&task.solution).run()?;
 
         //
         // Actually solve
@@ -218,13 +206,6 @@ impl Miner {
             task.solution.total_hashes
         );
 
-        let status = if self.cfg.self_submit {
-            "found_self_submit"
-        } else {
-            "found"
-        }
-        .to_string();
-
         //
         // Save solution to db
         //
@@ -238,14 +219,10 @@ impl Miner {
                 "found_time": time_to_string(&Utc::now()),
                 "time_taken_sec": start.elapsed().as_secs() as i32,
                 "total_hashes": task.solution.total_hashes,
-                "status": &status,
+                "status": "found".to_string(),
             }
         };
-        self.coll_submit
-            .as_ref()
-            .unwrap()
-            .update_one(query, update)
-            .run()?;
+        self.coll_submit.update_one(query, update).run()?;
         println!("💾 Saved {}:{}", challenge_id, addr_short);
 
         Ok(())
@@ -394,11 +371,9 @@ impl Miner {
     // Helper functions
     //
 
-    fn fetch_config(&self, db: &Database, instance_id: &str) -> Result<Config> {
-        let coll: Collection<Config> = db.collection(&self.mongo_cfg.coll_config);
-
+    fn fetch_config(&self, instance_id: &str) -> anyhow::Result<Config> {
         let filter = doc! { "_id": instance_id };
-        let result = coll.find_one(filter).run()?;
+        let result = self.coll_config.find_one(filter).run()?;
         let mut cfg =
             result.ok_or_else(|| anyhow::anyhow!("No config for instance '{}'", instance_id))?;
 
@@ -412,11 +387,9 @@ impl Miner {
         Ok(cfg)
     }
 
-    fn fetch_addresses(&self, db: &Database, address_id: &str) -> Result<Vec<String>> {
-        let coll: Collection<Address> = db.collection(&self.mongo_cfg.coll_address);
-
+    fn fetch_addresses(&self, address_id: &str) -> anyhow::Result<Vec<String>> {
         let filter = doc! { "tag": address_id };
-        let cursor = coll.find(filter).run()?;
+        let cursor = self.coll_address.find(filter).run()?;
         let mut addresses = Vec::new();
         for result in cursor {
             let doc = result?;
@@ -427,10 +400,9 @@ impl Miner {
 
     fn fetch_challenges(
         &self,
-        db: &Database,
         done_chall: &Vec<String>,
         limit: i64,
-    ) -> Result<Vec<Challenge>> {
+    ) -> anyhow::Result<Vec<Challenge>> {
         let time_limit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64 + 3600;
 
         let filter = doc! {
@@ -443,8 +415,12 @@ impl Miner {
             .limit(limit)
             .build();
 
-        let coll: Collection<Challenge> = db.collection(&self.mongo_cfg.coll_challenge);
-        let mut cursor = coll.find(filter).with_options(find_options).run()?;
+        // let coll: Collection<Challenge> = db.collection(&self.mongo_cfg.coll_challenge);
+        let mut cursor = self
+            .coll_challenge
+            .find(filter)
+            .with_options(find_options)
+            .run()?;
         let mut challenges = Vec::new();
 
         while let Some(challenge) = cursor.next() {
@@ -454,7 +430,11 @@ impl Miner {
         Ok(challenges)
     }
 
-    fn build_tasks(&self, challenge: &Challenge, addresses: &Vec<String>) -> Result<Vec<Task>> {
+    fn build_tasks(
+        &self,
+        challenge: &Challenge,
+        addresses: &Vec<String>,
+    ) -> anyhow::Result<Vec<Task>> {
         let mut tasks = Vec::new();
         let rom = Arc::new(create_rom(&challenge.challenge.no_pre_mine));
 
@@ -492,20 +472,13 @@ impl Miner {
             time_taken_sec: 0,
             total_hashes: 0,
             submitter_id: self.cfg.submitter_id.clone(),
-            status: if self.cfg.self_submit {
-                "onit_self_submit"
-            } else {
-                "onit"
-            }
-            .to_string(),
+            status: "onit".to_string(),
         }
     }
 
-    fn fetch_done_addresses(&self, db: &Database, challenge_id: &str) -> Result<HashSet<String>> {
-        let coll: Collection<Solution> = db.collection(&self.mongo_cfg.coll_submit);
-
+    fn fetch_done_addresses(&self, challenge_id: &str) -> anyhow::Result<HashSet<String>> {
         let filter = doc! { "challenge_id": challenge_id };
-        let cursor = coll.find(filter).run()?;
+        let cursor = self.coll_submit.find(filter).run()?;
         let mut addresses = HashSet::new();
         for result in cursor {
             let doc = result?;
@@ -532,18 +505,7 @@ pub struct Config {
     pub id: String,
     pub address_id: String,
     pub num_threads: i32,
-    pub self_submit: bool,
     pub submitter_id: String,
     pub timeout_sec: i32,
     pub max_hash_count: i32,
-}
-
-#[derive(Debug)]
-pub struct MongodbConfig {
-    pub mongo_url: String,
-    pub mongo_db: String,
-    pub coll_config: String,
-    pub coll_challenge: String,
-    pub coll_address: String,
-    pub coll_submit: String,
 }
