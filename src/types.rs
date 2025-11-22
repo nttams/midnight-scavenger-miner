@@ -34,6 +34,8 @@ pub struct Challenge {
     pub challenge: ChallengeData,
     pub total_challenges: i32,
     pub next_challenge_starts_at: String,
+
+    #[serde(default)]
     pub latest_submission_epoch: i32,
 }
 
