@@ -1,7 +1,5 @@
 use miner::miner::*;
 use std::env;
-use std::thread;
-use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
     let instance_id = env::args().nth(1).unwrap_or_else(|| "default".to_string());
@@ -19,11 +17,5 @@ fn main() -> anyhow::Result<()> {
     };
 
     let m = Miner::new(&instance_id, mongodb_config);
-    loop {
-        println!("================================");
-        println!("starting a new run");
-        println!("================================");
-        m.run()?;
-        thread::sleep(Duration::from_millis(100));
-    }
+    m.start_mining()
 }
