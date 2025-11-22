@@ -31,6 +31,9 @@ impl Solution {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Challenge {
+    #[serde(default, rename = "_id")]
+    pub id: String,
+
     pub challenge: ChallengeData,
     pub total_challenges: i32,
     pub next_challenge_starts_at: String,
@@ -86,4 +89,26 @@ pub struct Task {
     pub addr: String,
     pub challenge: Challenge,
     pub solution: Solution,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MongodbConfig {
+    pub mongo_url: String,
+    pub mongo_db: String,
+    pub coll_config: String,
+    pub coll_challenge: String,
+    pub coll_address: String,
+    pub coll_submit: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubmitResponse {
+    pub crypto_receipt: CryptoReceipt,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CryptoReceipt {
+    pub preimage: String,
+    pub timestamp: String,
+    pub signature: String,
 }

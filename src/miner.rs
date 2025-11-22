@@ -1,6 +1,5 @@
 use crate::types::*;
 use crate::utils::*;
-use anyhow::Result;
 use ashmaize::*;
 use chrono::Utc;
 use mongodb::bson::Bson;
@@ -152,7 +151,7 @@ impl Miner {
         Ok(())
     }
 
-    fn handle_task(&self, task: &mut Task) -> Result<()> {
+    fn handle_task(&self, task: &mut Task) -> anyhow::Result<()> {
         let challenge_id = task.challenge.challenge.challenge_id.clone();
         let addr_short = shorten_address(&task.addr);
 
@@ -207,13 +206,6 @@ impl Miner {
             task.solution.total_hashes
         );
 
-        let status = if self.cfg.self_submit {
-            "found_self_submit"
-        } else {
-            "found"
-        }
-        .to_string();
-
         //
         // Save solution to db
         //
@@ -227,7 +219,7 @@ impl Miner {
                 "found_time": time_to_string(&Utc::now()),
                 "time_taken_sec": start.elapsed().as_secs() as i32,
                 "total_hashes": task.solution.total_hashes,
-                "status": &status,
+                "status": "found".to_string(),
             }
         };
         self.coll_submit.update_one(query, update).run()?;
@@ -379,7 +371,7 @@ impl Miner {
     // Helper functions
     //
 
-    fn fetch_config(&self, instance_id: &str) -> Result<Config> {
+    fn fetch_config(&self, instance_id: &str) -> anyhow::Result<Config> {
         let filter = doc! { "_id": instance_id };
         let result = self.coll_config.find_one(filter).run()?;
         let mut cfg =
@@ -395,7 +387,7 @@ impl Miner {
         Ok(cfg)
     }
 
-    fn fetch_addresses(&self, address_id: &str) -> Result<Vec<String>> {
+    fn fetch_addresses(&self, address_id: &str) -> anyhow::Result<Vec<String>> {
         let filter = doc! { "tag": address_id };
         let cursor = self.coll_address.find(filter).run()?;
         let mut addresses = Vec::new();
@@ -406,7 +398,11 @@ impl Miner {
         Ok(addresses)
     }
 
-    fn fetch_challenges(&self, done_chall: &Vec<String>, limit: i64) -> Result<Vec<Challenge>> {
+    fn fetch_challenges(
+        &self,
+        done_chall: &Vec<String>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<Challenge>> {
         let time_limit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64 + 3600;
 
         let filter = doc! {
@@ -434,7 +430,11 @@ impl Miner {
         Ok(challenges)
     }
 
-    fn build_tasks(&self, challenge: &Challenge, addresses: &Vec<String>) -> Result<Vec<Task>> {
+    fn build_tasks(
+        &self,
+        challenge: &Challenge,
+        addresses: &Vec<String>,
+    ) -> anyhow::Result<Vec<Task>> {
         let mut tasks = Vec::new();
         let rom = Arc::new(create_rom(&challenge.challenge.no_pre_mine));
 
@@ -472,16 +472,11 @@ impl Miner {
             time_taken_sec: 0,
             total_hashes: 0,
             submitter_id: self.cfg.submitter_id.clone(),
-            status: if self.cfg.self_submit {
-                "onit_self_submit"
-            } else {
-                "onit"
-            }
-            .to_string(),
+            status: "onit".to_string(),
         }
     }
 
-    fn fetch_done_addresses(&self, challenge_id: &str) -> Result<HashSet<String>> {
+    fn fetch_done_addresses(&self, challenge_id: &str) -> anyhow::Result<HashSet<String>> {
         let filter = doc! { "challenge_id": challenge_id };
         let cursor = self.coll_submit.find(filter).run()?;
         let mut addresses = HashSet::new();
@@ -510,18 +505,7 @@ pub struct Config {
     pub id: String,
     pub address_id: String,
     pub num_threads: i32,
-    pub self_submit: bool,
     pub submitter_id: String,
     pub timeout_sec: i32,
     pub max_hash_count: i32,
-}
-
-#[derive(Debug, Clone)]
-pub struct MongodbConfig {
-    pub mongo_url: String,
-    pub mongo_db: String,
-    pub coll_config: String,
-    pub coll_challenge: String,
-    pub coll_address: String,
-    pub coll_submit: String,
 }

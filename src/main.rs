@@ -1,4 +1,5 @@
 use miner::miner::*;
+use miner::types::*;
 use std::env;
 
 fn main() -> anyhow::Result<()> {
