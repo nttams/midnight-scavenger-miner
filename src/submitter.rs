@@ -1,9 +1,13 @@
 use crate::types::*;
+use crate::utils::*;
 use anyhow::anyhow;
 use chrono::DateTime;
+use chrono::Utc;
+use mongodb::bson::doc;
 use mongodb::sync::Collection;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Submitter {
     cfg: Config,
@@ -24,6 +28,56 @@ impl Submitter {
             coll_challenge: mongo_db.collection(&mongodb_config.coll_challenge),
             coll_submit: mongo_db.collection(&mongodb_config.coll_submit),
         }
+    }
+
+    pub fn run(&self) -> anyhow::Result<()> {
+        let mut last_chall_update = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        loop {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            if now - last_chall_update > 60 {
+                self.fetch_and_update_challenge()?;
+                last_chall_update = now;
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(1)); // traffic is low, no rush
+        }
+    }
+
+    pub fn fetch_and_update_challenge(&self) -> anyhow::Result<Challenge> {
+        let challenge = self.fetch_challenge()?;
+        self.write_challenge(&challenge)?;
+        Ok(challenge)
+    }
+
+    pub fn submit_solution_and_record(&self) -> anyhow::Result<()> {
+        let filter = doc! { "status": "found" };
+        let cursor = self.coll_submit.find(filter).run()?;
+        for result in cursor {
+            let doc = result?;
+            let submit_resp = self.submit_solution(&doc)?;
+            println!("Submitted solution: {:?}", submit_resp);
+            let update = doc! {
+                "$set": {
+                    "status": "submitted",
+                    "submitted_time": time_to_string(&Utc::now()),
+                    "submit_response": serde_json::to_string(&submit_resp)?,
+                }
+            };
+            self.coll_submit
+                .update_one(doc! { "_id": doc.id }, update)
+                .run()?;
+
+            std::thread::sleep(std::time::Duration::from_secs(1)); // traffic is low, no rush
+        }
+        Ok(())
     }
 
     pub fn fetch_challenge(&self) -> anyhow::Result<Challenge> {
